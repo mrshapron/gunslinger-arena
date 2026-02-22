@@ -783,6 +783,27 @@ let pvpRoundTimer = 0;
 let pvpWinner = '';
 
 // ─── ONLINE MULTIPLAYER ───
+// Netcode tuning constants:
+// - Ping <80ms excellent, 80-150ms acceptable, >150ms noticeable delay.
+// - Jitter <10ms stable, 10-30ms okay, >30ms: increase INTERP_BUFFER_MS.
+// - Loss <1% normal, 1-5% tolerable, >5% connection issues.
+// - INTERP_BUFFER_MS: 2-3x tick interval. Higher = smoother remote, more visual lag.
+// - EXTRAP_CAP_MS: 1-2x tick interval. Higher = more extrapolation (risk of overshoot).
+// - RECONCILE_BLEND_FRAMES: 6-12 frames. Higher = smoother corrections, slower convergence.
+const NET_TICK_RATE = 20;
+const NET_TICK_INTERVAL = 1000 / NET_TICK_RATE;
+const NET_FULL_SYNC_RATE = 4;
+const NET_FULL_SYNC_INTERVAL = 1000 / NET_FULL_SYNC_RATE;
+const NET_INPUT_RATE = 30;
+const NET_INPUT_INTERVAL = 1000 / NET_INPUT_RATE;
+const INTERP_BUFFER_MS = 100;
+const EXTRAP_CAP_MS = 80;
+const RECONCILE_SNAP_DIST = 200;
+const RECONCILE_BLEND_DIST = 4;
+const RECONCILE_BLEND_FRAMES = 8;
+const SNAPSHOT_BUFFER_SIZE = 40;
+const PING_SAMPLE_SIZE = 20;
+
 let onlineMode = false;
 let isHost = false;
 let isClient = false;
@@ -797,16 +818,36 @@ let sfxBuffer = [];
 let floatingTextBuffer = [];
 let onlineMenuSelection = 0;
 let clientInputState = { keys: { left: false, right: false, shoot: false, shield: false }, events: [] };
-let stateSyncInterval = null;
-let inputSendInterval = null;
 let lastPeerMessage = 0;
 let heartbeatInterval = null;
-let fullSyncInterval = null;
+
+// Sequence numbers and message queue
+let localSeq = 0;
+let remoteSeq = 0;
+let inboundMessageQueue = [];
+
+// Frame-based tick scheduling (replaces setInterval)
+let lastTickSendTime = 0;
+let lastFullSyncTime = 0;
+let lastInputSendTime = 0;
+
+// Snapshot interpolation (client, for remote player)
 let remoteSnapshots = [];
-let INTERP_DELAY = 60;
-let jitterSamples = [];
-let lastPacketTime = 0;
-let packetCount = 0;
+let remotePlayerAlpha = 1.0;
+
+// Reconciliation blend (client, for local player)
+let reconcileOffset = { x: 0, y: 0 };
+let reconcileFramesLeft = 0;
+
+// Metrics
+let pingSamples = [];
+let currentPing = 0;
+let currentJitter = 0;
+let packetLossCount = 0;
+let packetTotalCount = 0;
+let packetLossRate = 0;
+let lastPingTimestamp = 0;
+let showNetDebug = false;
 
 // ─── LEVEL DEFINITIONS ───
 const levels = [
@@ -1322,6 +1363,7 @@ document.addEventListener('keydown', e => {
   if (['arrowup','arrowdown','arrowleft','arrowright',' '].includes(e.key.toLowerCase())) e.preventDefault();
   initAudio();
   if (e.key.toLowerCase() === 'm' && state !== 'online-join') { muted = !muted; return; }
+  if (e.key === '`' && onlineMode) { showNetDebug = !showNetDebug; return; }
 
   // Pause menu
   if (e.key === 'Escape' && state === 'playing') {
@@ -2413,7 +2455,12 @@ function connectWs(onConnect, attempt) {
   wsClient.onmessage = function(event) {
     try {
       const msg = JSON.parse(event.data);
-      handleWsMessage(msg);
+      // Server control messages process immediately; game messages queue
+      if (msg.type !== 'relayed') {
+        handleWsMessage(msg);
+      } else {
+        inboundMessageQueue.push(msg);
+      }
     } catch(e) {}
   };
 
@@ -2430,6 +2477,8 @@ function connectWs(onConnect, attempt) {
 
 function wsSend(data) {
   if (wsClient && wsConnected) {
+    data._seq = ++localSeq;
+    data._t = performance.now();
     wsClient.send(JSON.stringify({ type: 'relay', data: data }));
   }
 }
@@ -2450,12 +2499,8 @@ function handleWsMessage(msg) {
     coopMode = true;
     wsSend({ type: 'welcome', pvpMode: pvpMode });
     if (pvpMode) { startPvpGame(); } else { startGame(); }
-    stateSyncInterval = setInterval(function() {
-      if (wsConnected) sendPositionTick();
-    }, 20);
-    fullSyncInterval = setInterval(function() {
-      if (wsConnected) sendFullSync();
-    }, 200);
+    lastTickSendTime = performance.now();
+    lastFullSyncTime = performance.now();
     heartbeatInterval = setInterval(function() {
       if (Date.now() - lastPeerMessage > 10000) handleDisconnect();
     }, 3000);
@@ -2476,6 +2521,18 @@ function handleWsMessage(msg) {
   if (msg.type === 'relayed' && msg.data) {
     const data = msg.data;
     lastPeerMessage = Date.now();
+
+    // Sequence validation: drop out-of-order state messages
+    if (data._seq !== undefined) {
+      packetTotalCount++;
+      if (data.type === 'state' && data._seq <= remoteSeq) {
+        return; // Stale state packet — drop
+      }
+      if (data._seq > remoteSeq + 1 && remoteSeq > 0) {
+        packetLossCount += (data._seq - remoteSeq - 1);
+      }
+      remoteSeq = data._seq;
+    }
 
     if (data.type === 'welcome' && isClient) {
       connectionStatus = 'Connected!';
@@ -2499,9 +2556,7 @@ function handleWsMessage(msg) {
       p2Kills = 0;
       pvpWinner = '';
       if (pvpMode) { generatePvpArena(); } else { generatePlatforms(); }
-      inputSendInterval = setInterval(function() {
-        if (wsConnected) sendClientInput();
-      }, 25);
+      lastInputSendTime = performance.now();
       heartbeatInterval = setInterval(function() {
         if (Date.now() - lastPeerMessage > 10000) handleDisconnect();
       }, 3000);
@@ -2520,6 +2575,14 @@ function handleWsMessage(msg) {
     if (data.type === 'state' && isClient) {
       applyHostState(data);
     }
+  }
+}
+
+function drainMessageQueue() {
+  let queue = inboundMessageQueue;
+  inboundMessageQueue = [];
+  for (let i = 0; i < queue.length; i++) {
+    handleWsMessage(queue[i]);
   }
 }
 
@@ -2548,9 +2611,6 @@ function joinRoom(code) {
 }
 
 function cleanupOnline() {
-  if (stateSyncInterval) { clearInterval(stateSyncInterval); stateSyncInterval = null; }
-  if (fullSyncInterval) { clearInterval(fullSyncInterval); fullSyncInterval = null; }
-  if (inputSendInterval) { clearInterval(inputSendInterval); inputSendInterval = null; }
   if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
   if (wsClient) { try { wsClient.close(); } catch(e) {} wsClient = null; }
   wsConnected = false;
@@ -2566,11 +2626,24 @@ function cleanupOnline() {
   sfxBuffer = [];
   floatingTextBuffer = [];
   clientInputState = { keys: { left: false, right: false, shoot: false, shield: false }, events: [] };
+  // Reset netcode state
+  localSeq = 0;
+  remoteSeq = 0;
+  inboundMessageQueue = [];
+  lastTickSendTime = 0;
+  lastFullSyncTime = 0;
+  lastInputSendTime = 0;
   remoteSnapshots = [];
-  jitterSamples = [];
-  lastPacketTime = 0;
-  packetCount = 0;
-  INTERP_DELAY = 60;
+  remotePlayerAlpha = 1.0;
+  reconcileOffset = { x: 0, y: 0 };
+  reconcileFramesLeft = 0;
+  pingSamples = [];
+  currentPing = 0;
+  currentJitter = 0;
+  packetLossCount = 0;
+  packetTotalCount = 0;
+  packetLossRate = 0;
+  lastPingTimestamp = 0;
 }
 
 function handleDisconnect() {
@@ -2595,6 +2668,19 @@ function applyRemoteInput(data) {
   if (data.events) {
     data.events.forEach(event => processRemoteEvent(player2, event));
   }
+
+  // Ping measurement: compute RTT from echoed host timestamp
+  if (data._echoT && data._echoT > 0) {
+    let rtt = performance.now() - data._echoT;
+    if (rtt > 0 && rtt < 2000) {
+      pingSamples.push(rtt);
+      if (pingSamples.length > PING_SAMPLE_SIZE) pingSamples.shift();
+      currentPing = pingSamples.reduce((a, b) => a + b, 0) / pingSamples.length;
+      let mean = currentPing;
+      let variance = pingSamples.reduce((sum, s) => sum + (s - mean) ** 2, 0) / pingSamples.length;
+      currentJitter = Math.sqrt(variance);
+    }
+  }
 }
 
 function sendClientInput() {
@@ -2608,6 +2694,7 @@ function sendClientInput() {
       shield: isClientKeyPressed('shield'),
     },
     events: clientInputState.events.splice(0),
+    _echoT: lastPingTimestamp,
   });
 }
 
@@ -2640,6 +2727,8 @@ function sendPositionTick() {
   let msg = {
     type: 'state',
     tick: true,
+    _hostT: performance.now(),
+    rtt: Math.round(currentPing),
     p1: p1 ? [r2(p1.x), r2(p1.y), r2(p1.vx), r2(p1.vy), p1.facing, p1.alive ? 1 : 0] : null,
     p2: p2 ? [r2(p2.x), r2(p2.y), r2(p2.vx), r2(p2.vy), p2.facing, p2.alive ? 1 : 0] : null,
     e: enemies.map(e => [r2(e.x), r2(e.y), e.facing, e.alive ? 1 : 0, e.health]),
@@ -2698,8 +2787,6 @@ function sendFullSync() {
     screenShake: screenShake,
     levelIntroTimer: levelIntroTimer,
     levelTransitionTimer: levelTransitionTimer,
-    sfx: sfxBuffer.splice(0),
-    texts: floatingTextBuffer.splice(0),
     pvpMode: pvpMode,
     p1Kills: p1Kills,
     p2Kills: p2Kills,
@@ -2734,16 +2821,25 @@ function applyPlayerState(p, data) {
 
 function applyPlayerStateSmooth(p, data, isLocal) {
   if (isLocal) {
-    // Optimistic: trust local prediction for position, only snap on huge divergence
+    // Server reconciliation: 3-zone correction
     let dx = data.x - p.x;
     let dy = data.y - p.y;
     let dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist > 120) {
-      // Teleport/respawn — snap
+    if (dist > RECONCILE_SNAP_DIST) {
+      // Large discrepancy (teleport/respawn): hard snap
       p.x = data.x; p.y = data.y;
       p.vx = data.vx; p.vy = data.vy;
+      reconcileOffset.x = 0;
+      reconcileOffset.y = 0;
+      reconcileFramesLeft = 0;
+    } else if (dist > RECONCILE_BLEND_DIST) {
+      // Medium discrepancy: blend correction over several frames
+      reconcileOffset.x += dx;
+      reconcileOffset.y += dy;
+      reconcileFramesLeft = RECONCILE_BLEND_FRAMES;
     }
-    // Sync authoritative game state (health, weapons, etc.) but NOT position/velocity
+    // <= RECONCILE_BLEND_DIST: sub-pixel noise, ignore
+    // Always sync authoritative non-position state
     p.health = data.health; p.maxHealth = data.maxHealth;
     p.alive = data.alive;
     p.weapon = data.weapon;
@@ -2758,11 +2854,11 @@ function applyPlayerStateSmooth(p, data, isLocal) {
   } else {
     // Remote player: push snapshot for interpolation buffer
     remoteSnapshots.push({
+      seq: data._seq || 0,
       time: performance.now(),
       x: data.x, y: data.y, vx: data.vx, vy: data.vy, facing: data.facing
     });
-    // Keep max 30 snapshots (~600ms at 50Hz)
-    if (remoteSnapshots.length > 30) remoteSnapshots.shift();
+    if (remoteSnapshots.length > SNAPSHOT_BUFFER_SIZE) remoteSnapshots.shift();
     // Sync non-position state immediately
     p.onGround = data.onGround;
     p.jumps = data.jumps;
@@ -2787,20 +2883,11 @@ function applyPlayerStateSmooth(p, data, isLocal) {
 }
 
 function applyHostState(data) {
-  // Adaptive jitter tracking
   let now = performance.now();
-  if (lastPacketTime > 0) {
-    let interval = now - lastPacketTime;
-    let deviation = Math.abs(interval - 20);
-    jitterSamples.push(deviation);
-    if (jitterSamples.length > 30) jitterSamples.shift();
-    packetCount++;
-    if (packetCount % 30 === 0 && jitterSamples.length > 5) {
-      let avgJitter = jitterSamples.reduce((a, b) => a + b, 0) / jitterSamples.length;
-      INTERP_DELAY = Math.max(40, Math.min(120, 20 + avgJitter * 2.5));
-    }
-  }
-  lastPacketTime = now;
+
+  // Store host timestamp for ping echo, and host-computed RTT for display
+  if (data._hostT) lastPingTimestamp = data._hostT;
+  if (data.rtt !== undefined) currentPing = data.rtt;
 
   // SFX and floating texts are handled in both tick and full paths
   if (data.sfx) {
@@ -2815,19 +2902,27 @@ function applyHostState(data) {
     if (data.p1) {
       // data.p1 = [x, y, vx, vy, facing, alive]
       remoteSnapshots.push({
+        seq: data._seq || 0,
         time: now, x: data.p1[0], y: data.p1[1],
         vx: data.p1[2], vy: data.p1[3], facing: data.p1[4]
       });
-      if (remoteSnapshots.length > 30) remoteSnapshots.shift();
+      if (remoteSnapshots.length > SNAPSHOT_BUFFER_SIZE) remoteSnapshots.shift();
       player.alive = !!data.p1[5];
     }
     if (data.p2) {
-      // Local player position reconciliation
+      // Local player: smooth reconciliation (3-zone)
       let dx = data.p2[0] - player2.x;
       let dy = data.p2[1] - player2.y;
-      if (Math.sqrt(dx * dx + dy * dy) > 120) {
+      let dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > RECONCILE_SNAP_DIST) {
         player2.x = data.p2[0]; player2.y = data.p2[1];
         player2.vx = data.p2[2]; player2.vy = data.p2[3];
+        reconcileOffset.x = 0; reconcileOffset.y = 0;
+        reconcileFramesLeft = 0;
+      } else if (dist > RECONCILE_BLEND_DIST) {
+        reconcileOffset.x += dx;
+        reconcileOffset.y += dy;
+        reconcileFramesLeft = RECONCILE_BLEND_FRAMES;
       }
       player2.alive = !!data.p2[5];
     }
@@ -3020,9 +3115,10 @@ function clientUpdate() {
     }
   }
 
-  // Remote player (player1): snapshot interpolation buffer
+  // Remote player (player1): snapshot interpolation with capped extrapolation
   if (player && player.alive && remoteSnapshots.length >= 2) {
-    let renderTime = performance.now() - INTERP_DELAY;
+    let now = performance.now();
+    let renderTime = now - INTERP_BUFFER_MS;
     let snaps = remoteSnapshots;
     // Find two snapshots bracketing renderTime
     let s0 = null, s1 = null;
@@ -3034,24 +3130,41 @@ function clientUpdate() {
       }
     }
     if (s0 && s1) {
+      // Normal interpolation between two known states
       let t = (renderTime - s0.time) / (s1.time - s0.time);
       t = Math.max(0, Math.min(1, t));
       player.x = s0.x + (s1.x - s0.x) * t;
       player.y = s0.y + (s1.y - s0.y) * t;
       player.facing = s1.facing;
-    } else if (snaps.length > 0) {
-      // No bracketing snapshots — extrapolate from latest
+      remotePlayerAlpha = 1.0;
+    } else {
+      // No bracketing pair — extrapolate from latest snapshot
       let latest = snaps[snaps.length - 1];
-      let elapsed = (performance.now() - latest.time) / 16.67;
-      player.x = latest.x + latest.vx * elapsed;
-      player.y = latest.y + latest.vy * elapsed;
-      player.facing = latest.facing;
+      let timeSinceLatest = now - latest.time;
+      if (timeSinceLatest <= EXTRAP_CAP_MS) {
+        // Short extrapolation: project from last known velocity + gravity
+        let elapsed = timeSinceLatest / (1000 / 90);
+        player.x = latest.x + latest.vx * elapsed;
+        player.y = latest.y + latest.vy * elapsed + 0.5 * GRAVITY * elapsed * elapsed;
+        player.facing = latest.facing;
+        remotePlayerAlpha = 1.0 - (timeSinceLatest / EXTRAP_CAP_MS) * 0.3;
+      } else {
+        // Extrapolation cap exceeded: freeze + fade
+        let capElapsed = EXTRAP_CAP_MS / (1000 / 90);
+        player.x = latest.x + latest.vx * capElapsed;
+        player.y = latest.y + latest.vy * capElapsed + 0.5 * GRAVITY * capElapsed * capElapsed;
+        player.facing = latest.facing;
+        let overMs = timeSinceLatest - EXTRAP_CAP_MS;
+        remotePlayerAlpha = Math.max(0.3, 0.7 - overMs / 500);
+      }
     }
+    // Clamp to world bounds
     if (player.y + player.h >= GROUND) { player.y = GROUND - player.h; }
     player.x = Math.max(player.w / 2, Math.min(canvas.width - player.w / 2, player.x));
   } else if (player && player.alive && remoteSnapshots.length === 1) {
     let s = remoteSnapshots[0];
     player.x = s.x; player.y = s.y; player.facing = s.facing;
+    remotePlayerAlpha = 1.0;
   }
 
   // Local player (player2): full client-side physics
@@ -3078,6 +3191,22 @@ function clientUpdate() {
     });
 
     p.x = Math.max(p.w / 2, Math.min(canvas.width - p.w / 2, p.x));
+
+    // Apply smooth reconciliation blend (ease-out correction from server)
+    if (reconcileFramesLeft > 0) {
+      let factor = 1 / reconcileFramesLeft;
+      let corrX = reconcileOffset.x * factor;
+      let corrY = reconcileOffset.y * factor;
+      p.x += corrX;
+      p.y += corrY;
+      reconcileOffset.x -= corrX;
+      reconcileOffset.y -= corrY;
+      reconcileFramesLeft--;
+      if (reconcileFramesLeft <= 0) {
+        reconcileOffset.x = 0;
+        reconcileOffset.y = 0;
+      }
+    }
 
     if (p.dashing || Math.abs(p.vx) > 3) {
       p.trail.push({ x: p.x, y: p.y, alpha: 0.5 });
@@ -3184,6 +3313,9 @@ function clientUpdate() {
 function update() {
   if (paused) return;
 
+  // Drain inbound message queue (process network at start of frame)
+  if (onlineMode) drainMessageQueue();
+
   // Handle disconnect countdown
   if (disconnected) {
     disconnectTimer--;
@@ -3192,6 +3324,32 @@ function update() {
       state = 'menu';
     }
     return;
+  }
+
+  // Frame-based network tick scheduling (replaces setInterval)
+  if (onlineMode && wsConnected) {
+    let now = performance.now();
+    if (isHost) {
+      if (now - lastTickSendTime >= NET_TICK_INTERVAL) {
+        sendPositionTick();
+        lastTickSendTime = now;
+      }
+      if (now - lastFullSyncTime >= NET_FULL_SYNC_INTERVAL) {
+        sendFullSync();
+        lastFullSyncTime = now;
+      }
+    }
+    if (isClient) {
+      if (now - lastInputSendTime >= NET_INPUT_INTERVAL) {
+        sendClientInput();
+        lastInputSendTime = now;
+      }
+    }
+  }
+
+  // Recalculate packet loss rate periodically
+  if (packetTotalCount > 0 && packetTotalCount % 60 === 0) {
+    packetLossRate = packetLossCount / (packetTotalCount + packetLossCount);
   }
 
   // Client uses clientUpdate instead
@@ -5984,7 +6142,12 @@ function draw() {
 
   // Players
   if (state === 'playing') {
+    // Apply extrapolation alpha fade to remote player
+    if (onlineMode && isClient && remotePlayerAlpha < 1.0) {
+      ctx.globalAlpha = remotePlayerAlpha;
+    }
     drawPlayer(player);
+    ctx.globalAlpha = 1.0;
     if (player2) drawPlayer(player2);
 
     // P1/P2 labels in co-op, with YOU indicator in online
@@ -6860,6 +7023,33 @@ function draw() {
     ctx.fillStyle = '#555';
     ctx.font = '14px monospace';
     ctx.fillText('Press ESC to resume', canvas.width / 2, 370);
+  }
+
+  // ─── NET DEBUG OVERLAY ───
+  if (onlineMode && showNetDebug) {
+    ctx.save();
+    let boxH = isHost ? 106 : 92;
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+    ctx.fillRect(canvas.width - 184, 4, 180, boxH);
+    let pingColor = currentPing < 80 ? '#0f0' : currentPing < 150 ? '#ff0' : '#f00';
+    ctx.fillStyle = pingColor;
+    ctx.fillRect(canvas.width - 184, 4, 3, boxH);
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'left';
+    let nx = canvas.width - 176;
+    let ny = 17;
+    let lh = 13;
+    ctx.fillStyle = '#0f0';
+    ctx.fillText('PING: ' + Math.round(currentPing) + ' ms', nx, ny); ny += lh;
+    ctx.fillText('JITTER: ' + Math.round(currentJitter) + ' ms', nx, ny); ny += lh;
+    ctx.fillText('LOSS: ' + (packetLossRate * 100).toFixed(1) + '%', nx, ny); ny += lh;
+    ctx.fillText('SEQ: in=' + remoteSeq + ' out=' + localSeq, nx, ny); ny += lh;
+    ctx.fillText('SNAPS: ' + remoteSnapshots.length + '/' + SNAPSHOT_BUFFER_SIZE, nx, ny); ny += lh;
+    ctx.fillText('INTERP: ' + INTERP_BUFFER_MS + 'ms / CAP: ' + EXTRAP_CAP_MS + 'ms', nx, ny); ny += lh;
+    if (isHost) {
+      ctx.fillText('TICK: ' + NET_TICK_RATE + 'Hz / FULL: ' + NET_FULL_SYNC_RATE + 'Hz', nx, ny); ny += lh;
+    }
+    ctx.restore();
   }
 
   // ─── VERSION NUMBER ───
