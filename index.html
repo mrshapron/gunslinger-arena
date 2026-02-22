@@ -1289,6 +1289,7 @@ const keys = {};
 const P1_KEYS = { left: ['a', 'arrowleft'], right: ['d', 'arrowright'], shoot: ['f', 'j', 'z'], shield: 'e', reload: 'r', dash: 'q' };
 const P1_KEYS_COOP = { left: 'a', right: 'd', shoot: 'f', shield: 'e', reload: 'r', dash: 'q' };
 const P2_KEYS = { left: 'arrowleft', right: 'arrowright', shoot: '/', shield: '.', reload: ';', dash: "'" };
+const REMOTE_P2_KEYS = { left: '_r_left', right: '_r_right', shoot: '_r_shoot', shield: '_r_shield', reload: '_r_reload', dash: '_r_dash' };
 
 function isKeyPressed(keyConfig) {
   if (Array.isArray(keyConfig)) return keyConfig.some(k => keys[k]);
@@ -1308,11 +1309,8 @@ function performDash(p) {
   }
 }
 
-const P2_BLOCK_KEYS = ['arrowleft', 'arrowright', 'arrowup', '/', '.', ';', "'", ','];
 document.addEventListener('keydown', e => {
   let lk = e.key.toLowerCase();
-  // In online mode, block local keyboard from controlling the remote player
-  if (onlineMode && isHost && P2_BLOCK_KEYS.includes(lk)) { e.preventDefault(); return; }
   keys[lk] = true;
   if (['arrowup','arrowdown','arrowleft','arrowright',' '].includes(e.key.toLowerCase())) e.preventDefault();
   initAudio();
@@ -1499,8 +1497,8 @@ document.addEventListener('keydown', e => {
   }
 
   if (state === 'playing') {
-    // P1 Jump (w always, ArrowUp/Space only in solo)
-    if ((e.key.toLowerCase() === 'w' || (!coopMode && (e.key === ' ' || e.key === 'ArrowUp'))) && player.alive && player.jumps > 0) {
+    // P1 Jump (w always, ArrowUp/Space in solo or online)
+    if ((e.key.toLowerCase() === 'w' || ((!coopMode || onlineMode) && (e.key === ' ' || e.key === 'ArrowUp'))) && player.alive && player.jumps > 0) {
       if (player.jumps === 1) SFX.doubleJump(); else SFX.jump();
       player.vy = player.jumps === 2 ? JUMP_FORCE : DOUBLE_JUMP_FORCE;
       player.onGround = false;
@@ -1517,8 +1515,8 @@ document.addEventListener('keydown', e => {
       spawnJumpDust(player2);
       if (player2.jumps === 0) spawnDoubleJumpEffect(player2);
     }
-    // P1 Dash (q always, Shift only in solo)
-    if ((e.key.toLowerCase() === 'q' || (!coopMode && e.key === 'Shift')) && player.alive && player.dashCooldown <= 0 && !player.dashing) {
+    // P1 Dash (q always, Shift in solo or online)
+    if ((e.key.toLowerCase() === 'q' || ((!coopMode || onlineMode) && e.key === 'Shift')) && player.alive && player.dashCooldown <= 0 && !player.dashing) {
       performDash(player);
     }
     // P2 Dash (local co-op only)
@@ -1545,11 +1543,7 @@ document.addEventListener('keydown', e => {
     }
   }
 });
-document.addEventListener('keyup', e => {
-  let lk = e.key.toLowerCase();
-  if (onlineMode && isHost && P2_BLOCK_KEYS.includes(lk)) return;
-  keys[lk] = false;
-});
+document.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
 // Mute button click handler
 const MUTE_BTN = { x: canvas.width - 38, y: canvas.height - 32, w: 26, h: 22 };
@@ -2544,19 +2538,19 @@ function handleDisconnect() {
   disconnected = true;
   disconnectTimer = 180;
   if (isHost) {
-    keys['arrowleft'] = false;
-    keys['arrowright'] = false;
-    keys['/'] = false;
-    keys['.'] = false;
+    keys['_r_left'] = false;
+    keys['_r_right'] = false;
+    keys['_r_shoot'] = false;
+    keys['_r_shield'] = false;
   }
 }
 
 function applyRemoteInput(data) {
   if (!player2) return;
-  keys['arrowleft'] = data.keys.left;
-  keys['arrowright'] = data.keys.right;
-  keys['/'] = data.keys.shoot;
-  keys['.'] = data.keys.shield;
+  keys['_r_left'] = data.keys.left;
+  keys['_r_right'] = data.keys.right;
+  keys['_r_shoot'] = data.keys.shoot;
+  keys['_r_shield'] = data.keys.shield;
 
   if (data.events) {
     data.events.forEach(event => processRemoteEvent(player2, event));
@@ -2899,9 +2893,9 @@ function update() {
   }
 
   // Player movement
-  let p1Keys = coopMode ? P1_KEYS_COOP : P1_KEYS;
+  let p1Keys = (coopMode && !onlineMode) ? P1_KEYS_COOP : P1_KEYS;
   updatePlayerMovement(player, p1Keys, dt);
-  if (player2) updatePlayerMovement(player2, P2_KEYS, dt);
+  if (player2) updatePlayerMovement(player2, (onlineMode && isHost) ? REMOTE_P2_KEYS : P2_KEYS, dt);
 
   // ─── ENEMIES ───
   enemies.forEach(e => {
