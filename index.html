@@ -2690,21 +2690,27 @@ function applyPlayerState(p, data) {
 
 function applyPlayerStateSmooth(p, data, isLocal) {
   if (isLocal) {
-    // Local player: only correct if too far from server, don't snap
+    // Optimistic: trust local prediction for position, only snap on huge divergence
     let dx = data.x - p.x;
     let dy = data.y - p.y;
     let dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist > 60) {
-      // Too far off, snap
+    if (dist > 120) {
+      // Teleport/respawn — snap
       p.x = data.x; p.y = data.y;
       p.vx = data.vx; p.vy = data.vy;
-    } else if (dist > 5) {
-      // Gently correct toward server position
-      p.x += dx * 0.3;
-      p.y += dy * 0.3;
     }
-    // Always sync facing from server if not moving
-    if (data.vx !== 0) p.facing = data.facing;
+    // Sync authoritative game state (health, weapons, etc.) but NOT position/velocity
+    p.health = data.health; p.maxHealth = data.maxHealth;
+    p.alive = data.alive;
+    p.weapon = data.weapon;
+    p.shielding = data.shielding;
+    p.shieldEnergy = data.shieldEnergy;
+    p.maxShieldEnergy = data.maxShieldEnergy;
+    p.lastHitTimer = data.lastHitTimer;
+    p.onGround = data.onGround;
+    p.jumps = data.jumps;
+    if (data.grenadeCount !== undefined) p.grenadeCount = data.grenadeCount;
+    if (data.grenadeCooldown !== undefined) p.grenadeCooldown = data.grenadeCooldown;
   } else {
     // Remote player: interpolate with velocity extrapolation
     let targetX = data.x + data.vx * 2;
@@ -2714,26 +2720,26 @@ function applyPlayerStateSmooth(p, data, isLocal) {
     p.vx = data.vx;
     p.vy = data.vy;
     p.facing = data.facing;
+    p.onGround = data.onGround;
+    p.jumps = data.jumps;
+    p.health = data.health; p.maxHealth = data.maxHealth;
+    p.dashing = data.dashing;
+    p.dashTimer = data.dashTimer;
+    p.dashCooldown = data.dashCooldown;
+    p.invincible = data.invincible;
+    p.ammo = data.ammo; p.maxAmmo = data.maxAmmo;
+    p.reloading = data.reloading;
+    p.reloadTimer = data.reloadTimer;
+    p.weapon = data.weapon;
+    p.shielding = data.shielding;
+    p.shieldEnergy = data.shieldEnergy;
+    p.maxShieldEnergy = data.maxShieldEnergy;
+    p.alive = data.alive;
+    p.shootCooldown = data.shootCooldown;
+    p.lastHitTimer = data.lastHitTimer;
+    if (data.grenadeCount !== undefined) p.grenadeCount = data.grenadeCount;
+    if (data.grenadeCooldown !== undefined) p.grenadeCooldown = data.grenadeCooldown;
   }
-  p.onGround = data.onGround;
-  p.jumps = data.jumps;
-  p.health = data.health; p.maxHealth = data.maxHealth;
-  p.dashing = data.dashing;
-  p.dashTimer = data.dashTimer;
-  p.dashCooldown = data.dashCooldown;
-  p.invincible = data.invincible;
-  p.ammo = data.ammo; p.maxAmmo = data.maxAmmo;
-  p.reloading = data.reloading;
-  p.reloadTimer = data.reloadTimer;
-  p.weapon = data.weapon;
-  p.shielding = data.shielding;
-  p.shieldEnergy = data.shieldEnergy;
-  p.maxShieldEnergy = data.maxShieldEnergy;
-  p.alive = data.alive;
-  p.shootCooldown = data.shootCooldown;
-  p.lastHitTimer = data.lastHitTimer;
-  if (data.grenadeCount !== undefined) p.grenadeCount = data.grenadeCount;
-  if (data.grenadeCooldown !== undefined) p.grenadeCooldown = data.grenadeCooldown;
 }
 
 function applyHostState(data) {
@@ -2829,12 +2835,26 @@ function clientUpdate() {
 
   // Client-side movement prediction for local player (player2)
   if (player2 && player2.alive && state === 'playing') {
-    let moveDir = 0;
-    if (isClientKeyPressed('left')) moveDir = -1;
-    if (isClientKeyPressed('right')) moveDir = 1;
-    if (moveDir !== 0) {
+    if (!player2.dashing) {
+      let moveDir = 0;
+      if (isClientKeyPressed('left')) moveDir = -1;
+      if (isClientKeyPressed('right')) moveDir = 1;
       player2.vx = moveDir * MOVE_SPEED;
-      player2.facing = moveDir;
+      if (moveDir !== 0) player2.facing = moveDir;
+    }
+    if (player2.dashing) {
+      player2.dashTimer--;
+      if (player2.dashTimer <= 0) player2.dashing = false;
+    }
+    if (player2.dashCooldown > 0) player2.dashCooldown -= dt;
+    if (player2.shootCooldown > 0) player2.shootCooldown -= dt;
+    if (player2.invincible > 0) player2.invincible -= dt;
+    if (player2.reloading) {
+      player2.reloadTimer -= dt;
+      if (player2.reloadTimer <= 0) {
+        player2.reloading = false;
+        player2.ammo = player2.maxAmmo;
+      }
     }
   }
 
