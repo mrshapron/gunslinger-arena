@@ -2431,7 +2431,7 @@ function handleMqttMessage(topic, data) {
       // Player joined
       connectionStatus = 'Connected!';
       coopMode = true;
-      mqttPublish('gs-arena/' + roomCode + '/lobby', { type: 'welcome' });
+      mqttPublish('gs-arena/' + roomCode + '/lobby', { type: 'welcome', pvpMode: pvpMode });
       if (pvpMode) { startPvpGame(); } else { startGame(); }
       stateSyncInterval = setInterval(function() {
         if (mqttConnected) sendGameState();
@@ -2444,10 +2444,11 @@ function handleMqttMessage(topic, data) {
     if (isClient && data.type === 'welcome') {
       connectionStatus = 'Connected!';
       coopMode = true;
-      state = 'levelIntro';
-      levelIntroTimer = 180;
-      player = createPlayer(canvas.width / 3);
-      player2 = createPlayer(canvas.width * 2 / 3, { body: '#27ae60', dash: '#f39c12', skin: '#f4d35e', hat: '#1a5c2e', hatBand: '#f39c12', shoe: '#f39c12' });
+      pvpMode = !!data.pvpMode;
+      state = pvpMode ? 'pvpIntro' : 'levelIntro';
+      levelIntroTimer = pvpMode ? 120 : 180;
+      player = createPlayer(pvpMode ? canvas.width / 4 : canvas.width / 3);
+      player2 = createPlayer(pvpMode ? canvas.width * 3 / 4 : canvas.width * 2 / 3, { body: '#27ae60', dash: '#f39c12', skin: '#f4d35e', hat: '#1a5c2e', hatBand: '#f39c12', shoe: '#f39c12' });
       bullets = [];
       enemies = [];
       particles = [];
@@ -2458,7 +2459,10 @@ function handleMqttMessage(topic, data) {
       score = 0;
       level = 1;
       wave = 0;
-      generatePlatforms();
+      p1Kills = 0;
+      p2Kills = 0;
+      pvpWinner = '';
+      if (pvpMode) { generatePvpArena(); } else { generatePlatforms(); }
       inputSendInterval = setInterval(function() {
         if (mqttConnected) sendClientInput();
       }, 25);
@@ -2683,7 +2687,8 @@ function applyHostState(data) {
     };
   });
 
-  bullets = data.bullets.map(b => ({ ...b, trail: [], damage: 0 }));
+  let predicted = bullets.filter(b => b.predicted && b.life > 0);
+  bullets = data.bullets.map(b => ({ ...b, trail: [], damage: 0 })).concat(predicted);
   powerups = data.powerups;
   if (data.grenades) grenades = data.grenades;
 
@@ -3196,11 +3201,12 @@ function update() {
     }
 
     if (b.isPlayer && pvpMode) {
-      // PvP: hit the OTHER player
+      // PvP: hit the OTHER player (bigger hitbox online for lag compensation)
       let target = b.owner === 1 ? player2 : player;
+      let hitMul = onlineMode ? 1.5 : 1;
       if (target && target.alive && target.invincible <= 0 &&
-          Math.abs(b.x - target.x) < target.w / 2 + b.size &&
-          Math.abs(b.y - (target.y + target.h / 2)) < target.h / 2 + b.size) {
+          Math.abs(b.x - target.x) < (target.w / 2 + b.size) * hitMul &&
+          Math.abs(b.y - (target.y + target.h / 2)) < (target.h / 2 + b.size) * hitMul) {
         if (target.shielding) {
           b.life = 0;
           SFX.shieldBlock();
@@ -3213,27 +3219,47 @@ function update() {
           target.health -= pvpDmg;
           target.lastHitTimer = 0;
           b.life = 0;
-          screenShake = 6;
+          screenShake = 8;
           target.invincible = 30;
-          target.vx += b.vx * 0.3;
-          target.vy -= 2;
+          target.vx += b.vx * 0.4;
+          target.vy -= 3;
           SFX.playerHit();
           spawnBlood(target.x, target.y + target.h / 2);
-          addFloatingText('-' + b.damage, target.x, target.y, '#ff6b6b', 20, 40);
+          // Impact sparks
+          for (let i = 0; i < 8; i++) {
+            let angle = Math.random() * Math.PI * 2;
+            let speed = 2 + Math.random() * 5;
+            particles.push({ x: b.x, y: b.y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, life: 15, maxLife: 15, color: '#ffe66d', size: 2 + Math.random() * 2 });
+          }
+          // Hit flash ring
+          particles.push({ x: target.x, y: target.y + target.h / 2, vx: 0, vy: 0, life: 8, maxLife: 8, color: '#fff', size: 20, ring: true });
+          // Damage text with random offset
+          let ox = (Math.random() - 0.5) * 20;
+          addFloatingText('-' + pvpDmg, target.x + ox, target.y - 5, '#ff6b6b', 22, 45);
+          // Hit words
+          let hitWords = ['POW!', 'BAM!', 'WHAM!', 'HIT!', 'OUCH!', 'ZAP!', 'BOOM!'];
+          if (Math.random() > 0.5) {
+            addFloatingText(hitWords[Math.floor(Math.random() * hitWords.length)], target.x + (Math.random() - 0.5) * 40, target.y - 25, b.owner === 1 ? '#4ecdc4' : '#f39c12', 16, 35);
+          }
           if (target.health <= 0) {
             target.alive = false;
             SFX.playerDeath();
-            spawnExplosion(target.x, target.y + target.h / 2, '#ffe66d', 40);
+            spawnExplosion(target.x, target.y + target.h / 2, '#ffe66d', 50);
+            spawnExplosion(target.x, target.y + target.h / 2, '#ff6b6b', 30);
+            // Big kill text
+            let killerColor = b.owner === 1 ? '#3498db' : '#27ae60';
             if (b.owner === 1) {
               p1Kills++;
-              addFloatingText('P1 KILL!', canvas.width / 2, 100, '#3498db', 28, 90);
+              addFloatingText('K.O.!', canvas.width / 2, 80, killerColor, 36, 100);
+              addFloatingText(p1Kills + ' / ' + KILLS_TO_WIN, canvas.width / 2, 115, '#ffe66d', 18, 80);
             } else {
               p2Kills++;
-              addFloatingText('P2 KILL!', canvas.width / 2, 100, '#27ae60', 28, 90);
+              addFloatingText('K.O.!', canvas.width / 2, 80, killerColor, 36, 100);
+              addFloatingText(p2Kills + ' / ' + KILLS_TO_WIN, canvas.width / 2, 115, '#ffe66d', 18, 80);
             }
-            screenShake = 10;
-            slowMo = 0.3;
-            slowMoTimer = 30;
+            screenShake = 14;
+            slowMo = 0.2;
+            slowMoTimer = 40;
             if (p1Kills >= KILLS_TO_WIN || p2Kills >= KILLS_TO_WIN) {
               pvpWinner = p1Kills >= KILLS_TO_WIN ? 'P1' : 'P2';
               state = 'pvpWin';
@@ -5003,7 +5029,15 @@ function draw() {
   // Regular and fire particles
   particles.forEach(p => {
     let alpha = p.life / p.maxLife;
-    if (p.glow) {
+    if (p.ring) {
+      ctx.globalAlpha = alpha * 0.7;
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = 2;
+      let r = p.size * (1 - alpha) * 2;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      ctx.stroke();
+    } else if (p.glow) {
       let savedOp = ctx.globalCompositeOperation;
       ctx.globalCompositeOperation = 'lighter';
       ctx.globalAlpha = alpha * 0.8;
@@ -6543,6 +6577,15 @@ function draw() {
     ctx.fillText('Press ESC to resume', canvas.width / 2, 370);
   }
 }
+
+// ─── TAB VISIBILITY: pause music when switching tabs ───
+document.addEventListener('visibilitychange', function() {
+  if (document.hidden) {
+    if (audioCtx && musicGain) musicGain.gain.setValueAtTime(0, audioCtx.currentTime);
+  } else {
+    if (audioCtx && musicGain && !muted) musicGain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+  }
+});
 
 // ─── GAME LOOP (fixed timestep @ 60Hz) ───
 let lastFrameTime = 0;
