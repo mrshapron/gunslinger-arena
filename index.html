@@ -32,7 +32,7 @@
   <canvas id="game"></canvas>
   <script src="https://unpkg.com/mqtt@5.3.0/dist/mqtt.min.js"></script>
   <script>
-const GAME_VERSION = 'v1.0';
+const GAME_VERSION = 'v1.1';
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 canvas.width = 900;
@@ -2436,7 +2436,7 @@ function handleMqttMessage(topic, data) {
       if (pvpMode) { startPvpGame(); } else { startGame(); }
       stateSyncInterval = setInterval(function() {
         if (mqttConnected) sendGameState();
-      }, 25);
+      }, 33);
       // Start heartbeat check
       heartbeatInterval = setInterval(function() {
         if (Date.now() - lastPeerMessage > 10000) handleDisconnect();
@@ -2579,10 +2579,11 @@ function sendClientInput() {
   });
 }
 
+function r2(n) { return Math.round(n * 100) / 100; }
 function serializePlayer(p) {
   if (!p) return null;
   return {
-    x: p.x, y: p.y, vx: p.vx, vy: p.vy,
+    x: r2(p.x), y: r2(p.y), vx: r2(p.vx), vy: r2(p.vy),
     facing: p.facing, onGround: p.onGround, jumps: p.jumps,
     health: p.health, maxHealth: p.maxHealth,
     dashing: p.dashing, dashTimer: p.dashTimer, dashCooldown: p.dashCooldown,
@@ -2591,9 +2592,9 @@ function serializePlayer(p) {
     reloading: p.reloading, reloadTimer: p.reloadTimer,
     weapon: p.weapon,
     shielding: p.shielding,
-    shieldEnergy: p.shieldEnergy, maxShieldEnergy: p.maxShieldEnergy,
+    shieldEnergy: r2(p.shieldEnergy), maxShieldEnergy: p.maxShieldEnergy,
     alive: p.alive,
-    shootCooldown: p.shootCooldown,
+    shootCooldown: r2(p.shootCooldown),
     lastHitTimer: p.lastHitTimer,
     grenadeCount: p.grenadeCount,
     grenadeCooldown: p.grenadeCooldown,
@@ -2608,15 +2609,15 @@ function sendGameState() {
     p1: serializePlayer(player),
     p2: player2 ? serializePlayer(player2) : null,
     enemies: enemies.map(e => ({
-      x: e.x, y: e.y, type: e.type, health: e.health, maxHealth: e.maxHealth,
+      x: r2(e.x), y: r2(e.y), type: e.type, health: e.health, maxHealth: e.maxHealth,
       facing: e.facing, alive: e.alive, dying: !!e.dying, deathTimer: e.deathTimer || 0,
       deathVx: e.deathVx || 0, deathVy: e.deathVy || 0, deathRotation: e.deathRotation || 0,
-      deathRotSpeed: e.deathRotSpeed || 0, vy: e.vy, hit: e.hit,
+      deathRotSpeed: e.deathRotSpeed || 0, vy: r2(e.vy), hit: e.hit,
       speed: e.speed, boss: !!e.boss, bomber: !!e.bomber,
       flying: !!e.flying, mega: !!e.mega, flyBaseY: e.flyBaseY || 0, flyPhase: e.flyPhase || 0,
     })),
-    bullets: bullets.map(b => ({
-      x: b.x, y: b.y, vx: b.vx, vy: b.vy, color: b.color, size: b.size,
+    bullets: bullets.filter(b => !b.predicted).map(b => ({
+      x: r2(b.x), y: r2(b.y), vx: r2(b.vx), vy: r2(b.vy), color: b.color, size: b.size,
       isPlayer: b.isPlayer, owner: b.owner, life: b.life, explosive: !!b.explosive,
     })),
     powerups: powerups.map(p => ({
@@ -2670,13 +2671,60 @@ function applyPlayerState(p, data) {
   if (data.grenadeCooldown !== undefined) p.grenadeCooldown = data.grenadeCooldown;
 }
 
+function applyPlayerStateSmooth(p, data, isLocal) {
+  if (isLocal) {
+    // Local player: only correct if too far from server, don't snap
+    let dx = data.x - p.x;
+    let dy = data.y - p.y;
+    let dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > 60) {
+      // Too far off, snap
+      p.x = data.x; p.y = data.y;
+      p.vx = data.vx; p.vy = data.vy;
+    } else if (dist > 5) {
+      // Gently correct toward server position
+      p.x += dx * 0.3;
+      p.y += dy * 0.3;
+    }
+    // Always sync facing from server if not moving
+    if (data.vx !== 0) p.facing = data.facing;
+  } else {
+    // Remote player: interpolate smoothly
+    p.x += (data.x - p.x) * 0.4;
+    p.y += (data.y - p.y) * 0.4;
+    p.vx = data.vx;
+    p.vy = data.vy;
+    p.facing = data.facing;
+  }
+  p.onGround = data.onGround;
+  p.jumps = data.jumps;
+  p.health = data.health; p.maxHealth = data.maxHealth;
+  p.dashing = data.dashing;
+  p.dashTimer = data.dashTimer;
+  p.dashCooldown = data.dashCooldown;
+  p.invincible = data.invincible;
+  p.ammo = data.ammo; p.maxAmmo = data.maxAmmo;
+  p.reloading = data.reloading;
+  p.reloadTimer = data.reloadTimer;
+  p.weapon = data.weapon;
+  p.shielding = data.shielding;
+  p.shieldEnergy = data.shieldEnergy;
+  p.maxShieldEnergy = data.maxShieldEnergy;
+  p.alive = data.alive;
+  p.shootCooldown = data.shootCooldown;
+  p.lastHitTimer = data.lastHitTimer;
+  if (data.grenadeCount !== undefined) p.grenadeCount = data.grenadeCount;
+  if (data.grenadeCooldown !== undefined) p.grenadeCooldown = data.grenadeCooldown;
+}
+
 function applyHostState(data) {
-  if (data.p1) applyPlayerState(player, data.p1);
+  // Player1 is the opponent for the client, player2 is local
+  if (data.p1) applyPlayerStateSmooth(player, data.p1, false);
   if (data.p2) {
     if (!player2) {
       player2 = createPlayer(canvas.width * 2 / 3, { body: '#27ae60', dash: '#f39c12', skin: '#f4d35e', hat: '#1a5c2e', hatBand: '#f39c12', shoe: '#f39c12' });
     }
-    applyPlayerState(player2, data.p2);
+    applyPlayerStateSmooth(player2, data.p2, true);
   }
 
   enemies = data.enemies.map(e => {
