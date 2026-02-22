@@ -5588,17 +5588,19 @@ function draw() {
     drawPlayer(player);
     if (player2) drawPlayer(player2);
 
-    // P1/P2 labels in co-op
+    // P1/P2 labels in co-op, with YOU indicator in online
     if (coopMode) {
       ctx.font = 'bold 10px monospace';
       ctx.textAlign = 'center';
+      let p1IsLocal = !onlineMode || isHost;
+      let p2IsLocal = onlineMode && isClient;
       if (player.alive) {
-        ctx.fillStyle = player.bodyColor;
-        ctx.fillText('P1', player.x, player.y - 10);
+        ctx.fillStyle = p1IsLocal ? '#ffe66d' : player.bodyColor;
+        ctx.fillText(p1IsLocal ? 'YOU' : 'P1', player.x, player.y - 10);
       }
       if (player2 && player2.alive) {
-        ctx.fillStyle = player2.bodyColor;
-        ctx.fillText('P2', player2.x, player2.y - 10);
+        ctx.fillStyle = p2IsLocal ? '#ffe66d' : player2.bodyColor;
+        ctx.fillText(p2IsLocal ? 'YOU' : 'P2', player2.x, player2.y - 10);
       }
     }
   }
@@ -5642,7 +5644,8 @@ function draw() {
   ctx.fillStyle = '#fff';
   ctx.font = 'bold 10px monospace';
   ctx.textAlign = 'center';
-  ctx.fillText(coopMode ? `P1 ${p1hp}/${player.maxHealth}` : `HP ${p1hp}/${player.maxHealth}`, 20 + hudBarW / 2, 26);
+  let p1Label = coopMode ? ((onlineMode && isHost) ? 'YOU' : (onlineMode && isClient) ? 'OPP' : 'P1') : 'HP';
+  ctx.fillText(`${p1Label} ${p1hp}/${player.maxHealth}`, 20 + hudBarW / 2, 26);
   // P1 Regen indicator
   if (player.alive && player.lastHitTimer > 240 && player.health < player.maxHealth) {
     ctx.fillStyle = '#2ecc71';
@@ -5705,7 +5708,8 @@ function draw() {
     ctx.fillStyle = '#fff';
     ctx.font = 'bold 10px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText(`P2 ${p2hp}/${player2.maxHealth}`, p2x + hudBarW / 2, 26);
+    let p2Label = (onlineMode && isClient) ? 'YOU' : (onlineMode && isHost) ? 'OPP' : 'P2';
+    ctx.fillText(`${p2Label} ${p2hp}/${player2.maxHealth}`, p2x + hudBarW / 2, 26);
     // P2 Shield
     ctx.fillStyle = '#333';
     ctx.fillRect(p2x, 32, hudBarW, 8);
@@ -6082,7 +6086,14 @@ function draw() {
     let winColor = pvpWinner === 'P1' ? '#3498db' : '#27ae60';
     ctx.fillStyle = winColor;
     ctx.font = 'bold 48px monospace';
-    ctx.fillText(`${pvpWinner} WINS!`, canvas.width / 2, 160);
+    let winText = pvpWinner + ' WINS!';
+    if (onlineMode) {
+      let iWon = (isHost && pvpWinner === 'P1') || (isClient && pvpWinner === 'P2');
+      winText = iWon ? 'YOU WIN!' : 'YOU LOSE!';
+      winColor = iWon ? '#ffe66d' : '#e94560';
+      ctx.fillStyle = winColor;
+    }
+    ctx.fillText(winText, canvas.width / 2, 160);
 
     ctx.fillStyle = '#ffe66d';
     ctx.font = 'bold 24px monospace';
