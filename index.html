@@ -2644,6 +2644,16 @@ function sendPositionTick() {
     p2: p2 ? [r2(p2.x), r2(p2.y), r2(p2.vx), r2(p2.vy), p2.facing, p2.alive ? 1 : 0] : null,
     e: enemies.map(e => [r2(e.x), r2(e.y), e.facing, e.alive ? 1 : 0, e.health]),
     b: bullets.filter(b => !b.predicted).map(b => [r2(b.x), r2(b.y), r2(b.vx), r2(b.vy), b.life]),
+    st: state,
+    sm: slowMo,
+    ss: screenShake,
+    sc: score,
+    wv: wave,
+    wp: wavesPerLevel,
+    li: levelIntroTimer,
+    lt: levelTransitionTimer,
+    pk: pvpMode ? [p1Kills, p2Kills] : undefined,
+    pw: pvpWinner || undefined,
   };
   // Only include sfx/texts if they exist
   if (sfxBuffer.length > 0) msg.sfx = sfxBuffer.splice(0);
@@ -2845,6 +2855,17 @@ function applyHostState(data) {
         bullets[i].life = bd[4];
       }
     }
+    // Apply game state from tick
+    if (data.st) state = data.st;
+    if (data.sm !== undefined) slowMo = data.sm;
+    if (data.ss !== undefined) screenShake = data.ss;
+    if (data.sc !== undefined) score = data.sc;
+    if (data.wv !== undefined) wave = data.wv;
+    if (data.wp !== undefined) wavesPerLevel = data.wp;
+    if (data.li !== undefined) levelIntroTimer = data.li;
+    if (data.lt !== undefined) levelTransitionTimer = data.lt;
+    if (data.pk) { p1Kills = data.pk[0]; p2Kills = data.pk[1]; }
+    if (data.pw !== undefined) pvpWinner = data.pw;
     return;
   }
 
