@@ -2712,11 +2712,9 @@ function applyPlayerStateSmooth(p, data, isLocal) {
     if (data.grenadeCount !== undefined) p.grenadeCount = data.grenadeCount;
     if (data.grenadeCooldown !== undefined) p.grenadeCooldown = data.grenadeCooldown;
   } else {
-    // Remote player: interpolate with velocity extrapolation
-    let targetX = data.x + data.vx * 2;
-    let targetY = data.y;
-    p.x += (targetX - p.x) * 0.5;
-    p.y += (targetY - p.y) * 0.5;
+    // Remote player: store target and velocity for smooth between-update movement
+    p._targetX = data.x;
+    p._targetY = data.y;
     p.vx = data.vx;
     p.vy = data.vy;
     p.facing = data.facing;
@@ -2858,7 +2856,19 @@ function clientUpdate() {
     }
   }
 
-  [player, player2].forEach(p => {
+  // Remote player (player1): smooth interpolation toward server target
+  if (player && player.alive && player._targetX !== undefined) {
+    player.x += (player._targetX - player.x) * 0.25;
+    player.y += (player._targetY - player.y) * 0.25;
+    // Continue moving between updates using server velocity
+    player._targetX += player.vx * dt;
+    player._targetY += player.vy * dt;
+    if (player._targetY + player.h >= GROUND) { player._targetY = GROUND - player.h; }
+    player.x = Math.max(player.w / 2, Math.min(canvas.width - player.w / 2, player.x));
+  }
+
+  // Local player (player2): full client-side physics
+  [player2].forEach(p => {
     if (!p || !p.alive) return;
     p.vy += GRAVITY * dt;
     p.x += p.vx * dt;
