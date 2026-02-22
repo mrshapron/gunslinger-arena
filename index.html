@@ -6453,15 +6453,27 @@ function draw() {
   }
 }
 
-// ─── GAME LOOP ───
-function gameLoop() {
-  update();
+// ─── GAME LOOP (fixed timestep @ 60Hz) ───
+let lastFrameTime = 0;
+let accumulator = 0;
+const FIXED_DT = 1000 / 60; // ~16.667ms per tick
+
+function gameLoop(timestamp) {
+  if (lastFrameTime === 0) { lastFrameTime = timestamp; }
+  let elapsed = timestamp - lastFrameTime;
+  lastFrameTime = timestamp;
+  if (elapsed > 100) elapsed = 100; // cap to prevent spiral on tab-switch
+  accumulator += elapsed;
+  while (accumulator >= FIXED_DT) {
+    update();
+    updateMusic();
+    accumulator -= FIXED_DT;
+  }
   draw();
-  updateMusic();
   requestAnimationFrame(gameLoop);
 }
 
-gameLoop();
+requestAnimationFrame(gameLoop);
   </script>
 </body>
 </html>
