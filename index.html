@@ -2826,6 +2826,29 @@ function clientUpdate() {
     b.x += b.vx * dt;
     b.y += b.vy * dt;
     b.life -= dt;
+
+    // Client-side hit detection for visual feedback (no damage, host is authoritative)
+    if (b.isPlayer && pvpMode && b.life > 0) {
+      let target = b.owner === 1 ? player2 : player;
+      if (target && target.alive && target.invincible <= 0 &&
+          Math.abs(b.x - target.x) < target.w / 2 + b.size &&
+          Math.abs(b.y - (target.y + target.h / 2)) < target.h / 2 + b.size) {
+        b.life = 0;
+        if (target.shielding) {
+          SFX.shieldBlock();
+          screenShake = 2;
+          for (let i = 0; i < 5; i++) {
+            particles.push({ x: b.x, y: b.y, vx: (Math.random() - 0.5) * 6, vy: (Math.random() - 0.5) * 6, life: 10, maxLife: 10, color: '#66bbff', size: 3 });
+          }
+        } else {
+          SFX.playerHit();
+          spawnBlood(target.x, target.y + target.h / 2);
+          screenShake = 6;
+          target.vx += b.vx * 0.3;
+          target.vy -= 2;
+        }
+      }
+    }
   });
   bullets = bullets.filter(b => b.life > 0 && b.x > -50 && b.x < canvas.width + 50);
 
