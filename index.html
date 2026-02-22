@@ -2435,7 +2435,7 @@ function handleMqttMessage(topic, data) {
       if (pvpMode) { startPvpGame(); } else { startGame(); }
       stateSyncInterval = setInterval(function() {
         if (mqttConnected) sendGameState();
-      }, 50);
+      }, 25);
       // Start heartbeat check
       heartbeatInterval = setInterval(function() {
         if (Date.now() - lastPeerMessage > 10000) handleDisconnect();
@@ -2461,7 +2461,7 @@ function handleMqttMessage(topic, data) {
       generatePlatforms();
       inputSendInterval = setInterval(function() {
         if (mqttConnected) sendClientInput();
-      }, 50);
+      }, 25);
       heartbeatInterval = setInterval(function() {
         if (Date.now() - lastPeerMessage > 10000) handleDisconnect();
       }, 3000);
@@ -2718,8 +2718,51 @@ function applyHostState(data) {
   }
 }
 
+function clientShootPredict() {
+  if (!player2 || !player2.alive) return;
+  let p = player2;
+  if (p.shielding || p.shootCooldown > 0 || p.reloading || p.ammo <= 0) return;
+  if (!isClientKeyPressed('shoot')) return;
+  let wep = weapons[p.weapon];
+  p.shootCooldown = wep.fireRate;
+  let pellets = wep.pellets || 1;
+  for (let i = 0; i < pellets; i++) {
+    let spread = (Math.random() - 0.5) * wep.spread * 2;
+    let bx = p.x + p.facing * 20;
+    let by = p.y + 14;
+    bullets.push({
+      x: bx, y: by,
+      vx: Math.cos(spread) * wep.speed * p.facing,
+      vy: Math.sin(spread) * wep.speed,
+      damage: 0, color: wep.color, size: wep.size,
+      isPlayer: true, owner: 2, life: 80, trail: [], explosive: false,
+      predicted: true,
+    });
+  }
+  p.ammo--;
+  if (p.ammo <= 0) { p.reloading = true; p.reloadTimer = 50; }
+  if (SFX['shoot_' + p.weapon]) SFX['shoot_' + p.weapon]();
+  spawnMuzzleFlash(p.x + p.facing * 24, p.y + 14, p.facing);
+  spawnCasing(p.x, p.y + 10, p.facing);
+  screenShake = Math.max(screenShake, wep.fireRate > 15 ? 4 : 2);
+}
+
 function clientUpdate() {
   let dt = slowMo;
+
+  // Client-side shoot prediction for instant feedback
+  if (state === 'playing') clientShootPredict();
+
+  // Client-side movement prediction for local player (player2)
+  if (player2 && player2.alive && state === 'playing') {
+    let moveDir = 0;
+    if (isClientKeyPressed('left')) moveDir = -1;
+    if (isClientKeyPressed('right')) moveDir = 1;
+    if (moveDir !== 0) {
+      player2.vx = moveDir * MOVE_SPEED;
+      player2.facing = moveDir;
+    }
+  }
 
   [player, player2].forEach(p => {
     if (!p || !p.alive) return;
