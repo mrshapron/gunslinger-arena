@@ -1308,8 +1308,12 @@ function performDash(p) {
   }
 }
 
+const P2_BLOCK_KEYS = ['arrowleft', 'arrowright', 'arrowup', '/', '.', ';', "'", ','];
 document.addEventListener('keydown', e => {
-  keys[e.key.toLowerCase()] = true;
+  let lk = e.key.toLowerCase();
+  // In online mode, block local keyboard from controlling the remote player
+  if (onlineMode && isHost && P2_BLOCK_KEYS.includes(lk)) { e.preventDefault(); return; }
+  keys[lk] = true;
   if (['arrowup','arrowdown','arrowleft','arrowright',' '].includes(e.key.toLowerCase())) e.preventDefault();
   initAudio();
   if (e.key.toLowerCase() === 'm') { muted = !muted; return; }
@@ -1536,7 +1540,11 @@ document.addEventListener('keydown', e => {
     }
   }
 });
-document.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+document.addEventListener('keyup', e => {
+  let lk = e.key.toLowerCase();
+  if (onlineMode && isHost && P2_BLOCK_KEYS.includes(lk)) return;
+  keys[lk] = false;
+});
 
 // Mute button click handler
 const MUTE_BTN = { x: canvas.width - 38, y: canvas.height - 32, w: 26, h: 22 };
