@@ -1316,7 +1316,7 @@ document.addEventListener('keydown', e => {
   keys[lk] = true;
   if (['arrowup','arrowdown','arrowleft','arrowright',' '].includes(e.key.toLowerCase())) e.preventDefault();
   initAudio();
-  if (e.key.toLowerCase() === 'm') { muted = !muted; return; }
+  if (e.key.toLowerCase() === 'm' && state !== 'online-join') { muted = !muted; return; }
 
   // Pause menu
   if (e.key === 'Escape' && state === 'playing') {
