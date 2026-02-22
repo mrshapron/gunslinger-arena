@@ -2471,7 +2471,8 @@ function handleMqttMessage(topic, data) {
       pauseSelection = 0;
     }
     if (data.type === 'disconnect') {
-      handleDisconnect();
+      cleanupOnline();
+      state = 'menu';
     }
   }
 
