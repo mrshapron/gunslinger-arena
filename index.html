@@ -1322,6 +1322,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && state === 'playing') {
     paused = !paused;
     pauseSelection = 0;
+    if (onlineMode) mqttPublish('gs-arena/' + roomCode + '/lobby', { type: 'pause', paused: paused });
     return;
   }
   if (paused) {
@@ -1334,10 +1335,14 @@ document.addEventListener('keydown', e => {
     } else if (e.key === 'Enter' || e.key === ' ') {
       if (pauseSelection === 0) {
         paused = false;
+        if (onlineMode) mqttPublish('gs-arena/' + roomCode + '/lobby', { type: 'pause', paused: false });
       } else {
         paused = false;
         pvpMode = false;
-        if (onlineMode) cleanupOnline();
+        if (onlineMode) {
+          mqttPublish('gs-arena/' + roomCode + '/lobby', { type: 'disconnect' });
+          cleanupOnline();
+        }
         state = 'menu';
       }
     }
@@ -2464,6 +2469,10 @@ function handleMqttMessage(topic, data) {
       heartbeatInterval = setInterval(function() {
         if (Date.now() - lastPeerMessage > 10000) handleDisconnect();
       }, 3000);
+    }
+    if (data.type === 'pause') {
+      paused = data.paused;
+      pauseSelection = 0;
     }
     if (data.type === 'disconnect') {
       handleDisconnect();
