@@ -801,6 +801,12 @@ let stateSyncInterval = null;
 let inputSendInterval = null;
 let lastPeerMessage = 0;
 let heartbeatInterval = null;
+let fullSyncInterval = null;
+let remoteSnapshots = [];
+let INTERP_DELAY = 60;
+let jitterSamples = [];
+let lastPacketTime = 0;
+let packetCount = 0;
 
 // ─── LEVEL DEFINITIONS ───
 const levels = [
@@ -2445,8 +2451,11 @@ function handleWsMessage(msg) {
     wsSend({ type: 'welcome', pvpMode: pvpMode });
     if (pvpMode) { startPvpGame(); } else { startGame(); }
     stateSyncInterval = setInterval(function() {
-      if (wsConnected) sendGameState();
+      if (wsConnected) sendPositionTick();
     }, 20);
+    fullSyncInterval = setInterval(function() {
+      if (wsConnected) sendFullSync();
+    }, 200);
     heartbeatInterval = setInterval(function() {
       if (Date.now() - lastPeerMessage > 10000) handleDisconnect();
     }, 3000);
@@ -2540,6 +2549,7 @@ function joinRoom(code) {
 
 function cleanupOnline() {
   if (stateSyncInterval) { clearInterval(stateSyncInterval); stateSyncInterval = null; }
+  if (fullSyncInterval) { clearInterval(fullSyncInterval); fullSyncInterval = null; }
   if (inputSendInterval) { clearInterval(inputSendInterval); inputSendInterval = null; }
   if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
   if (wsClient) { try { wsClient.close(); } catch(e) {} wsClient = null; }
@@ -2556,6 +2566,11 @@ function cleanupOnline() {
   sfxBuffer = [];
   floatingTextBuffer = [];
   clientInputState = { keys: { left: false, right: false, shoot: false, shield: false }, events: [] };
+  remoteSnapshots = [];
+  jitterSamples = [];
+  lastPacketTime = 0;
+  packetCount = 0;
+  INTERP_DELAY = 60;
 }
 
 function handleDisconnect() {
@@ -2618,11 +2633,30 @@ function serializePlayer(p) {
   };
 }
 
-function sendGameState() {
+function sendPositionTick() {
+  if (!wsConnected) return;
+  let p1 = player;
+  let p2 = player2;
+  let msg = {
+    type: 'state',
+    tick: true,
+    p1: p1 ? [r2(p1.x), r2(p1.y), r2(p1.vx), r2(p1.vy), p1.facing, p1.alive ? 1 : 0] : null,
+    p2: p2 ? [r2(p2.x), r2(p2.y), r2(p2.vx), r2(p2.vy), p2.facing, p2.alive ? 1 : 0] : null,
+    e: enemies.map(e => [r2(e.x), r2(e.y), e.facing, e.alive ? 1 : 0, e.health]),
+    b: bullets.filter(b => !b.predicted).map(b => [r2(b.x), r2(b.y), r2(b.vx), r2(b.vy), b.life]),
+  };
+  // Only include sfx/texts if they exist
+  if (sfxBuffer.length > 0) msg.sfx = sfxBuffer.splice(0);
+  if (floatingTextBuffer.length > 0) msg.texts = floatingTextBuffer.splice(0);
+  wsSend(msg);
+}
+
+function sendFullSync() {
   if (!wsConnected) return;
 
   wsSend({
     type: 'state',
+    full: true,
     p1: serializePlayer(player),
     p2: player2 ? serializePlayer(player2) : null,
     enemies: enemies.map(e => ({
@@ -2712,12 +2746,14 @@ function applyPlayerStateSmooth(p, data, isLocal) {
     if (data.grenadeCount !== undefined) p.grenadeCount = data.grenadeCount;
     if (data.grenadeCooldown !== undefined) p.grenadeCooldown = data.grenadeCooldown;
   } else {
-    // Remote player: store target and velocity for smooth between-update movement
-    p._targetX = data.x;
-    p._targetY = data.y;
-    p.vx = data.vx;
-    p.vy = data.vy;
-    p.facing = data.facing;
+    // Remote player: push snapshot for interpolation buffer
+    remoteSnapshots.push({
+      time: performance.now(),
+      x: data.x, y: data.y, vx: data.vx, vy: data.vy, facing: data.facing
+    });
+    // Keep max 30 snapshots (~600ms at 50Hz)
+    if (remoteSnapshots.length > 30) remoteSnapshots.shift();
+    // Sync non-position state immediately
     p.onGround = data.onGround;
     p.jumps = data.jumps;
     p.health = data.health; p.maxHealth = data.maxHealth;
@@ -2741,6 +2777,78 @@ function applyPlayerStateSmooth(p, data, isLocal) {
 }
 
 function applyHostState(data) {
+  // Adaptive jitter tracking
+  let now = performance.now();
+  if (lastPacketTime > 0) {
+    let interval = now - lastPacketTime;
+    let deviation = Math.abs(interval - 20);
+    jitterSamples.push(deviation);
+    if (jitterSamples.length > 30) jitterSamples.shift();
+    packetCount++;
+    if (packetCount % 30 === 0 && jitterSamples.length > 5) {
+      let avgJitter = jitterSamples.reduce((a, b) => a + b, 0) / jitterSamples.length;
+      INTERP_DELAY = Math.max(40, Math.min(120, 20 + avgJitter * 2.5));
+    }
+  }
+  lastPacketTime = now;
+
+  // SFX and floating texts are handled in both tick and full paths
+  if (data.sfx) {
+    data.sfx.forEach(name => { if (SFX[name]) SFX[name](); });
+  }
+  if (data.texts) {
+    data.texts.forEach(t => { floatingTexts.push({ ...t, maxLife: t.life }); });
+  }
+
+  if (data.tick) {
+    // Fast tick: compact position-only updates
+    if (data.p1) {
+      // data.p1 = [x, y, vx, vy, facing, alive]
+      remoteSnapshots.push({
+        time: now, x: data.p1[0], y: data.p1[1],
+        vx: data.p1[2], vy: data.p1[3], facing: data.p1[4]
+      });
+      if (remoteSnapshots.length > 30) remoteSnapshots.shift();
+      player.alive = !!data.p1[5];
+    }
+    if (data.p2) {
+      // Local player position reconciliation
+      let dx = data.p2[0] - player2.x;
+      let dy = data.p2[1] - player2.y;
+      if (Math.sqrt(dx * dx + dy * dy) > 120) {
+        player2.x = data.p2[0]; player2.y = data.p2[1];
+        player2.vx = data.p2[2]; player2.vy = data.p2[3];
+      }
+      player2.alive = !!data.p2[5];
+    }
+    // Update enemy positions in-place
+    if (data.e) {
+      for (let i = 0; i < data.e.length && i < enemies.length; i++) {
+        let ed = data.e[i];
+        enemies[i].x = ed[0];
+        enemies[i].y = ed[1];
+        enemies[i].facing = ed[2];
+        enemies[i].alive = !!ed[3];
+        enemies[i].health = ed[4];
+      }
+    }
+    // Update bullet positions in-place
+    if (data.b) {
+      let predicted = bullets.filter(b => b.predicted && b.life > 0);
+      for (let i = 0; i < data.b.length && i < bullets.length; i++) {
+        if (bullets[i].predicted) continue;
+        let bd = data.b[i];
+        bullets[i].x = bd[0];
+        bullets[i].y = bd[1];
+        bullets[i].vx = bd[2];
+        bullets[i].vy = bd[3];
+        bullets[i].life = bd[4];
+      }
+    }
+    return;
+  }
+
+  // Full sync path
   // Player1 is the opponent for the client, player2 is local
   if (data.p1) applyPlayerStateSmooth(player, data.p1, false);
   if (data.p2) {
@@ -2750,17 +2858,64 @@ function applyHostState(data) {
     applyPlayerStateSmooth(player2, data.p2, true);
   }
 
-  enemies = data.enemies.map(e => {
+  // In-place enemy updates: reuse existing objects where possible
+  let newEnemies = data.enemies;
+  for (let i = 0; i < newEnemies.length; i++) {
+    let e = newEnemies[i];
     let def = enemyTypes[e.type];
-    return {
-      ...def, ...e,
-      w: def.w, h: def.h, color: def.color,
-      shootTimer: 0, patrolDir: e.facing,
-    };
-  });
+    if (i < enemies.length) {
+      // Update existing enemy in-place
+      let existing = enemies[i];
+      existing.x = e.x; existing.y = e.y;
+      existing.type = e.type;
+      existing.health = e.health; existing.maxHealth = e.maxHealth;
+      existing.facing = e.facing; existing.alive = e.alive;
+      existing.dying = !!e.dying; existing.deathTimer = e.deathTimer || 0;
+      existing.deathVx = e.deathVx || 0; existing.deathVy = e.deathVy || 0;
+      existing.deathRotation = e.deathRotation || 0;
+      existing.deathRotSpeed = e.deathRotSpeed || 0;
+      existing.vy = e.vy; existing.hit = e.hit;
+      existing.speed = e.speed; existing.boss = !!e.boss;
+      existing.bomber = !!e.bomber; existing.flying = !!e.flying;
+      existing.mega = !!e.mega; existing.flyBaseY = e.flyBaseY || 0;
+      existing.flyPhase = e.flyPhase || 0;
+      existing.w = def.w; existing.h = def.h; existing.color = def.color;
+    } else {
+      // New enemy — create fresh
+      enemies.push({
+        ...def, ...e,
+        w: def.w, h: def.h, color: def.color,
+        shootTimer: 0, patrolDir: e.facing,
+      });
+    }
+  }
+  // Trim extras
+  if (enemies.length > newEnemies.length) {
+    enemies.length = newEnemies.length;
+  }
 
+  // In-place bullet updates: preserve trail arrays
   let predicted = bullets.filter(b => b.predicted && b.life > 0);
-  bullets = data.bullets.map(b => ({ ...b, trail: [], damage: 0 })).concat(predicted);
+  let newBullets = data.bullets;
+  let nonPredicted = bullets.filter(b => !b.predicted);
+  for (let i = 0; i < newBullets.length; i++) {
+    let b = newBullets[i];
+    if (i < nonPredicted.length) {
+      let existing = nonPredicted[i];
+      existing.x = b.x; existing.y = b.y;
+      existing.vx = b.vx; existing.vy = b.vy;
+      existing.color = b.color; existing.size = b.size;
+      existing.isPlayer = b.isPlayer; existing.owner = b.owner;
+      existing.life = b.life; existing.explosive = !!b.explosive;
+    } else {
+      nonPredicted.push({ ...b, trail: [], damage: 0 });
+    }
+  }
+  if (nonPredicted.length > newBullets.length) {
+    nonPredicted.length = newBullets.length;
+  }
+  bullets = nonPredicted.concat(predicted);
+
   powerups = data.powerups;
   if (data.grenades) grenades = data.grenades;
 
@@ -2782,18 +2937,6 @@ function applyHostState(data) {
   if (data.p1Kills !== undefined) p1Kills = data.p1Kills;
   if (data.p2Kills !== undefined) p2Kills = data.p2Kills;
   if (data.pvpWinner !== undefined) pvpWinner = data.pvpWinner;
-
-  if (data.sfx) {
-    data.sfx.forEach(name => {
-      if (SFX[name]) SFX[name]();
-    });
-  }
-
-  if (data.texts) {
-    data.texts.forEach(t => {
-      floatingTexts.push({ ...t, maxLife: t.life });
-    });
-  }
 }
 
 function clientShootPredict() {
@@ -2856,15 +2999,38 @@ function clientUpdate() {
     }
   }
 
-  // Remote player (player1): smooth interpolation toward server target
-  if (player && player.alive && player._targetX !== undefined) {
-    player.x += (player._targetX - player.x) * 0.25;
-    player.y += (player._targetY - player.y) * 0.25;
-    // Continue moving between updates using server velocity
-    player._targetX += player.vx * dt;
-    player._targetY += player.vy * dt;
-    if (player._targetY + player.h >= GROUND) { player._targetY = GROUND - player.h; }
+  // Remote player (player1): snapshot interpolation buffer
+  if (player && player.alive && remoteSnapshots.length >= 2) {
+    let renderTime = performance.now() - INTERP_DELAY;
+    let snaps = remoteSnapshots;
+    // Find two snapshots bracketing renderTime
+    let s0 = null, s1 = null;
+    for (let i = snaps.length - 1; i >= 1; i--) {
+      if (snaps[i - 1].time <= renderTime && snaps[i].time >= renderTime) {
+        s0 = snaps[i - 1];
+        s1 = snaps[i];
+        break;
+      }
+    }
+    if (s0 && s1) {
+      let t = (renderTime - s0.time) / (s1.time - s0.time);
+      t = Math.max(0, Math.min(1, t));
+      player.x = s0.x + (s1.x - s0.x) * t;
+      player.y = s0.y + (s1.y - s0.y) * t;
+      player.facing = s1.facing;
+    } else if (snaps.length > 0) {
+      // No bracketing snapshots — extrapolate from latest
+      let latest = snaps[snaps.length - 1];
+      let elapsed = (performance.now() - latest.time) / 16.67;
+      player.x = latest.x + latest.vx * elapsed;
+      player.y = latest.y + latest.vy * elapsed;
+      player.facing = latest.facing;
+    }
+    if (player.y + player.h >= GROUND) { player.y = GROUND - player.h; }
     player.x = Math.max(player.w / 2, Math.min(canvas.width - player.w / 2, player.x));
+  } else if (player && player.alive && remoteSnapshots.length === 1) {
+    let s = remoteSnapshots[0];
+    player.x = s.x; player.y = s.y; player.facing = s.facing;
   }
 
   // Local player (player2): full client-side physics
