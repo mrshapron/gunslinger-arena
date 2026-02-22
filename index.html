@@ -6456,7 +6456,7 @@ function draw() {
 // ─── GAME LOOP (fixed timestep @ 60Hz) ───
 let lastFrameTime = 0;
 let accumulator = 0;
-const FIXED_DT = 1000 / 60; // ~16.667ms per tick
+const FIXED_DT = 1000 / 90; // 1.5x game speed
 
 function gameLoop(timestamp) {
   if (lastFrameTime === 0) { lastFrameTime = timestamp; }
