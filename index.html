@@ -1347,20 +1347,22 @@ document.addEventListener('keydown', e => {
     return;
   }
 
-  // Client input: queue events and return early
-  if (onlineMode && isClient && state === 'playing') {
+  // Client input: queue events and return early (all gameplay states)
+  if (onlineMode && isClient && (state === 'playing' || state === 'pvpIntro' || state === 'levelIntro')) {
     let k = e.key.toLowerCase();
-    if (k === 'w' || k === ' ' || e.key === 'ArrowUp') {
-      clientInputState.events.push('jump');
-    }
-    if (k === 'q' || e.key === 'Shift') {
-      clientInputState.events.push('dash');
-    }
-    if (k === 'r') {
-      clientInputState.events.push('reload');
-    }
-    if (k === 'g') {
-      clientInputState.events.push('grenade');
+    if (state === 'playing') {
+      if (k === 'w' || k === ' ' || e.key === 'ArrowUp') {
+        clientInputState.events.push('jump');
+      }
+      if (k === 'q' || e.key === 'Shift') {
+        clientInputState.events.push('dash');
+      }
+      if (k === 'r') {
+        clientInputState.events.push('reload');
+      }
+      if (k === 'g') {
+        clientInputState.events.push('grenade');
+      }
     }
     return;
   }
