@@ -1348,15 +1348,28 @@ document.addEventListener('keydown', e => {
     return;
   }
 
-  // Client input: queue events and return early (all gameplay states)
+  // Client input: queue events and predict locally for instant feedback
   if (onlineMode && isClient && (state === 'playing' || state === 'pvpIntro' || state === 'levelIntro')) {
     let k = e.key.toLowerCase();
     if (state === 'playing') {
       if (k === 'w' || k === ' ' || e.key === 'ArrowUp') {
         clientInputState.events.push('jump');
+        // Client-side jump prediction
+        if (player2 && player2.alive && player2.jumps > 0) {
+          if (player2.jumps === 1) SFX.doubleJump(); else SFX.jump();
+          player2.vy = player2.jumps === 2 ? JUMP_FORCE : DOUBLE_JUMP_FORCE;
+          player2.onGround = false;
+          player2.jumps--;
+          spawnJumpDust(player2);
+          if (player2.jumps === 0) spawnDoubleJumpEffect(player2);
+        }
       }
       if (k === 'q' || e.key === 'Shift') {
         clientInputState.events.push('dash');
+        // Client-side dash prediction
+        if (player2 && player2.alive && player2.dashCooldown <= 0 && !player2.dashing) {
+          performDash(player2);
+        }
       }
       if (k === 'r') {
         clientInputState.events.push('reload');
@@ -2433,7 +2446,7 @@ function handleWsMessage(msg) {
     if (pvpMode) { startPvpGame(); } else { startGame(); }
     stateSyncInterval = setInterval(function() {
       if (wsConnected) sendGameState();
-    }, 33);
+    }, 20);
     heartbeatInterval = setInterval(function() {
       if (Date.now() - lastPeerMessage > 10000) handleDisconnect();
     }, 3000);
@@ -2693,9 +2706,11 @@ function applyPlayerStateSmooth(p, data, isLocal) {
     // Always sync facing from server if not moving
     if (data.vx !== 0) p.facing = data.facing;
   } else {
-    // Remote player: interpolate smoothly
-    p.x += (data.x - p.x) * 0.4;
-    p.y += (data.y - p.y) * 0.4;
+    // Remote player: interpolate with velocity extrapolation
+    let targetX = data.x + data.vx * 2;
+    let targetY = data.y;
+    p.x += (targetX - p.x) * 0.5;
+    p.y += (targetY - p.y) * 0.5;
     p.vx = data.vx;
     p.vy = data.vy;
     p.facing = data.facing;
