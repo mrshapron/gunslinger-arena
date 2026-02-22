@@ -30,9 +30,9 @@
 </head>
 <body>
   <canvas id="game"></canvas>
-  <script src="https://unpkg.com/mqtt@5.3.0/dist/mqtt.min.js"></script>
   <script>
-const GAME_VERSION = 'v1.1';
+const RELAY_SERVER = 'wss://gunslinger-relay.onrender.com';
+const GAME_VERSION = 'v1.2';
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 canvas.width = 900;
@@ -786,8 +786,8 @@ let pvpWinner = '';
 let onlineMode = false;
 let isHost = false;
 let isClient = false;
-let mqttClient = null;
-let mqttConnected = false;
+let wsClient = null;
+let wsConnected = false;
 let roomCode = '';
 let roomCodeInput = '';
 let connectionStatus = '';
@@ -1321,7 +1321,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && state === 'playing') {
     paused = !paused;
     pauseSelection = 0;
-    if (onlineMode) mqttPublish('gs-arena/' + roomCode + '/lobby', { type: 'pause', paused: paused });
+    if (onlineMode) wsSend({ type: 'pause', paused: paused });
     return;
   }
   if (paused) {
@@ -1334,12 +1334,12 @@ document.addEventListener('keydown', e => {
     } else if (e.key === 'Enter' || e.key === ' ') {
       if (pauseSelection === 0) {
         paused = false;
-        if (onlineMode) mqttPublish('gs-arena/' + roomCode + '/lobby', { type: 'pause', paused: false });
+        if (onlineMode) wsSend({ type: 'pause', paused: false });
       } else {
         paused = false;
         pvpMode = false;
         if (onlineMode) {
-          mqttPublish('gs-arena/' + roomCode + '/lobby', { type: 'disconnect' });
+          wsSend({ type: 'disconnect' });
           cleanupOnline();
         }
         state = 'menu';
@@ -2368,81 +2368,94 @@ function processRemoteEvent(p, event) {
   }
 }
 
-const MQTT_BROKERS = [
-  'wss://broker.hivemq.com:8884/mqtt',
-  'wss://broker.emqx.io:8084/mqtt'
-];
-
-function connectMqtt(onConnect, brokerIndex) {
-  if (brokerIndex === undefined) brokerIndex = 0;
-  if (brokerIndex >= MQTT_BROKERS.length) {
+function connectWs(onConnect, attempt) {
+  if (attempt === undefined) attempt = 0;
+  if (attempt >= 3) {
     connectionStatus = 'Connection failed. Try again.';
     onlineMode = false; isHost = false; isClient = false;
     return;
   }
-  const clientId = 'gs-' + Math.random().toString(36).substr(2, 9);
-  const willTopic = 'gs-arena/' + roomCode + '/lobby';
-  mqttClient = mqtt.connect(MQTT_BROKERS[brokerIndex], {
-    clientId: clientId,
-    connectTimeout: 8000,
-    keepalive: 30,
-    will: { topic: willTopic, payload: JSON.stringify({ type: 'disconnect' }), qos: 0, retain: false }
-  });
+  if (attempt === 1) connectionStatus = 'Server may be starting up...';
+  if (attempt === 2) connectionStatus = 'Retrying...';
+
+  wsClient = new WebSocket(RELAY_SERVER);
 
   const timeout = setTimeout(function() {
-    if (mqttClient) { try { mqttClient.end(true); } catch(e) {} }
-    connectMqtt(onConnect, brokerIndex + 1);
-  }, 8000);
+    if (wsClient) { try { wsClient.close(); } catch(e) {} }
+    connectWs(onConnect, attempt + 1);
+  }, 15000);
 
-  mqttClient.on('connect', function() {
+  wsClient.onopen = function() {
     clearTimeout(timeout);
-    mqttConnected = true;
+    wsConnected = true;
     onConnect();
-  });
+  };
 
-  mqttClient.on('message', function(topic, message) {
+  wsClient.onmessage = function(event) {
     try {
-      const data = JSON.parse(message.toString());
-      handleMqttMessage(topic, data);
+      const msg = JSON.parse(event.data);
+      handleWsMessage(msg);
     } catch(e) {}
-  });
+  };
 
-  mqttClient.on('error', function() {
+  wsClient.onerror = function() {
     clearTimeout(timeout);
-    if (mqttClient) { try { mqttClient.end(true); } catch(e) {} }
-    connectMqtt(onConnect, brokerIndex + 1);
-  });
+    if (wsClient) { try { wsClient.close(); } catch(e) {} }
+    connectWs(onConnect, attempt + 1);
+  };
 
-  mqttClient.on('close', function() {
-    mqttConnected = false;
-  });
+  wsClient.onclose = function() {
+    wsConnected = false;
+  };
 }
 
-function mqttPublish(topic, data) {
-  if (mqttClient && mqttConnected) {
-    mqttClient.publish(topic, JSON.stringify(data), { qos: 0 });
+function wsSend(data) {
+  if (wsClient && wsConnected) {
+    wsClient.send(JSON.stringify({ type: 'relay', data: data }));
   }
 }
 
-function handleMqttMessage(topic, data) {
-  lastPeerMessage = Date.now();
+function handleWsMessage(msg) {
+  // Server control messages
+  if (msg.type === 'created') {
+    connectionStatus = 'Waiting for player...';
+    return;
+  }
+  if (msg.type === 'joined') {
+    connectionStatus = 'Waiting for host...';
+    return;
+  }
+  if (msg.type === 'peer_joined' && isHost) {
+    // Client connected to our room — send welcome and start game
+    connectionStatus = 'Connected!';
+    coopMode = true;
+    wsSend({ type: 'welcome', pvpMode: pvpMode });
+    if (pvpMode) { startPvpGame(); } else { startGame(); }
+    stateSyncInterval = setInterval(function() {
+      if (wsConnected) sendGameState();
+    }, 33);
+    heartbeatInterval = setInterval(function() {
+      if (Date.now() - lastPeerMessage > 10000) handleDisconnect();
+    }, 3000);
+    return;
+  }
+  if (msg.type === 'peer_disconnected') {
+    cleanupOnline();
+    state = 'menu';
+    return;
+  }
+  if (msg.type === 'error') {
+    connectionStatus = msg.message || 'Connection error';
+    return;
+  }
+  if (msg.type === 'pong') return;
 
-  if (topic.endsWith('/lobby')) {
-    if (isHost && data.type === 'join') {
-      // Player joined
-      connectionStatus = 'Connected!';
-      coopMode = true;
-      mqttPublish('gs-arena/' + roomCode + '/lobby', { type: 'welcome', pvpMode: pvpMode });
-      if (pvpMode) { startPvpGame(); } else { startGame(); }
-      stateSyncInterval = setInterval(function() {
-        if (mqttConnected) sendGameState();
-      }, 33);
-      // Start heartbeat check
-      heartbeatInterval = setInterval(function() {
-        if (Date.now() - lastPeerMessage > 10000) handleDisconnect();
-      }, 3000);
-    }
-    if (isClient && data.type === 'welcome') {
+  // Relayed game messages
+  if (msg.type === 'relayed' && msg.data) {
+    const data = msg.data;
+    lastPeerMessage = Date.now();
+
+    if (data.type === 'welcome' && isClient) {
       connectionStatus = 'Connected!';
       coopMode = true;
       pvpMode = !!data.pvpMode;
@@ -2465,7 +2478,7 @@ function handleMqttMessage(topic, data) {
       pvpWinner = '';
       if (pvpMode) { generatePvpArena(); } else { generatePlatforms(); }
       inputSendInterval = setInterval(function() {
-        if (mqttConnected) sendClientInput();
+        if (wsConnected) sendClientInput();
       }, 25);
       heartbeatInterval = setInterval(function() {
         if (Date.now() - lastPeerMessage > 10000) handleDisconnect();
@@ -2479,45 +2492,36 @@ function handleMqttMessage(topic, data) {
       cleanupOnline();
       state = 'menu';
     }
-  }
-
-  if (topic.endsWith('/input') && isHost) {
-    applyRemoteInput(data);
-  }
-
-  if (topic.endsWith('/state') && isClient) {
-    applyHostState(data);
+    if (data.type === 'input' && isHost) {
+      applyRemoteInput(data);
+    }
+    if (data.type === 'state' && isClient) {
+      applyHostState(data);
+    }
   }
 }
 
 function startHosting() {
   roomCode = generateRoomCode();
-  connectionStatus = 'Creating room...';
+  connectionStatus = 'Connecting to server...';
   isHost = true;
   onlineMode = true;
   lastPeerMessage = Date.now();
 
-  connectMqtt(function() {
-    const inputTopic = 'gs-arena/' + roomCode + '/input';
-    const lobbyTopic = 'gs-arena/' + roomCode + '/lobby';
-    mqttClient.subscribe([inputTopic, lobbyTopic]);
-    connectionStatus = 'Waiting for player...';
+  connectWs(function() {
+    wsClient.send(JSON.stringify({ type: 'create', room: roomCode }));
   });
 }
 
 function joinRoom(code) {
-  connectionStatus = 'Connecting...';
+  connectionStatus = 'Connecting to server...';
   isClient = true;
   onlineMode = true;
   roomCode = code;
   lastPeerMessage = Date.now();
 
-  connectMqtt(function() {
-    const stateTopic = 'gs-arena/' + code + '/state';
-    const lobbyTopic = 'gs-arena/' + code + '/lobby';
-    mqttClient.subscribe([stateTopic, lobbyTopic]);
-    mqttPublish('gs-arena/' + code + '/lobby', { type: 'join' });
-    connectionStatus = 'Waiting for host...';
+  connectWs(function() {
+    wsClient.send(JSON.stringify({ type: 'join', room: code }));
   });
 }
 
@@ -2525,8 +2529,8 @@ function cleanupOnline() {
   if (stateSyncInterval) { clearInterval(stateSyncInterval); stateSyncInterval = null; }
   if (inputSendInterval) { clearInterval(inputSendInterval); inputSendInterval = null; }
   if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
-  if (mqttClient) { try { mqttClient.end(true); } catch(e) {} mqttClient = null; }
-  mqttConnected = false;
+  if (wsClient) { try { wsClient.close(); } catch(e) {} wsClient = null; }
+  wsConnected = false;
   onlineMode = false;
   isHost = false;
   isClient = false;
@@ -2566,8 +2570,8 @@ function applyRemoteInput(data) {
 }
 
 function sendClientInput() {
-  if (!mqttConnected) return;
-  mqttPublish('gs-arena/' + roomCode + '/input', {
+  if (!wsConnected) return;
+  wsSend({
     type: 'input',
     keys: {
       left: isClientKeyPressed('left'),
@@ -2602,9 +2606,9 @@ function serializePlayer(p) {
 }
 
 function sendGameState() {
-  if (!mqttConnected) return;
+  if (!wsConnected) return;
 
-  mqttPublish('gs-arena/' + roomCode + '/state', {
+  wsSend({
     type: 'state',
     p1: serializePlayer(player),
     p2: player2 ? serializePlayer(player2) : null,
@@ -6586,7 +6590,7 @@ function draw() {
 
   // ─── ONLINE HUD INDICATOR ───
   if (onlineMode && (state === 'playing' || state === 'levelIntro' || state === 'pvpIntro')) {
-    let connected = mqttConnected;
+    let connected = wsConnected;
     ctx.fillStyle = connected ? '#2ecc71' : '#e94560';
     ctx.beginPath();
     ctx.arc(8, 8, 4, 0, Math.PI * 2);
